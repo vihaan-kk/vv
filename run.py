@@ -2,6 +2,8 @@ import requests
 import json
 import time
 import os
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_huggingface import HuggingFaceEmbeddings
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL = "qwen3:8b"
@@ -180,7 +182,21 @@ def flat_chunk(text, max_tokens=500):
 def fake_retrieve(chunks, top_k=2):
     return chunks[:top_k]   # return only the first top_k chunks
 
+def semantic_chunk(text):
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "mps"},          # M4 Metal acceleration
+        encode_kwargs={"normalize_embeddings": True}
+    )
 
+    splitter = SemanticChunker(
+        embeddings,
+        breakpoint_threshold_type="percentile",
+        breakpoint_threshold_amount=85
+    )
+
+    docs = splitter.create_documents([text])
+    return [doc.page_content for doc in docs]
 
 if __name__ == "__main__":
 
@@ -206,6 +222,20 @@ if __name__ == "__main__":
     results.append(run(
         "RUN 2 — BASELINE (flat chunking, top 2 chunks)",
         baseline_context
+    ))
+
+    # RUN 2.5 — SEMANTIC CHUNKING
+    # uses embedding similarity to detect topic shifts and split there
+    # smarter than flat chunking but still flat — no hierarchy awareness
+    # this represents the current best practice in most AI tools today
+    # -------------------------------------------------------
+    semantic_chunks = semantic_chunk(NDA_SECTION)
+    semantic_retrieved = fake_retrieve(semantic_chunks, top_k=2)
+    semantic_context = "\n\n---\n\n".join(semantic_retrieved)
+
+    results.append(run(
+        "RUN 3 — SEMANTIC CHUNKING (topic-shift, top 2 chunks)",
+        semantic_context
     ))
 
     # -------------------------------------------------------
