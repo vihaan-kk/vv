@@ -1,3 +1,4 @@
+import re
 import requests
 import json
 import time
@@ -13,6 +14,60 @@ OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "results.json")
 
 NDA_SECTION = Path(os.path.join(os.path.dirname(__file__), "nda_section.md")).read_text()
 PROMPT = Path(os.path.join(os.path.dirname(__file__), "prompt.md")).read_text()
+
+# --- DETERMINISTIC COMPARISON ---
+# parses the structured output into {field: value} pairs and compares
+# each run against the ground truth line-by-line
+
+def parse_output(output):
+    """Extract '- Field: Value' lines into a dict."""
+    fields = {}
+    for line in output.split("\n"):
+        match = re.match(r'\s*-\s+(.+?):\s*(.*)', line)
+        if match:
+            key = match.group(1).strip()
+            value = match.group(2).strip()
+            fields[key] = value
+    return fields
+
+def compare_to_ground_truth(ground_truth, run_result):
+    """Compare a run's parsed output against the ground truth field by field."""
+    gt_fields = parse_output(ground_truth["output"])
+    run_fields = parse_output(run_result["output"])
+
+    missing = []     # GT has a value, run has [NOT FOUND]
+    mismatches = []  # Both have values but they differ
+    exact_matches = 0
+
+    for field, gt_value in gt_fields.items():
+        run_value = run_fields.get(field, "[NOT FOUND]")
+        gt_not_found = gt_value == "[NOT FOUND]"
+        run_not_found = run_value == "[NOT FOUND]"
+
+        if gt_not_found:
+            continue  # GT itself didn't find this — not a fair comparison point
+        elif run_not_found:
+            missing.append({"field": field, "expected": gt_value})
+        elif gt_value.lower().strip() == run_value.lower().strip():
+            exact_matches += 1
+        else:
+            mismatches.append({"field": field, "expected": gt_value, "actual": run_value})
+
+    gt_fields_with_value = sum(1 for v in gt_fields.values() if v != "[NOT FOUND]")
+    score = round(exact_matches / gt_fields_with_value, 3) if gt_fields_with_value > 0 else 0
+
+    return {
+        "compared_to": ground_truth["run"],
+        "gt_fields_with_value": gt_fields_with_value,
+        "exact_matches": exact_matches,
+        "missing_in_run": len(missing),
+        "mismatches": len(mismatches),
+        "score": score,
+        "details": {
+            "missing": missing,
+            "mismatches": mismatches
+        }
+    }
 
 # --- RUN FUNCTION ---
 # this function takes a label (what to call the run) and a context (what to
@@ -157,6 +212,11 @@ if __name__ == "__main__":
     # once your friend's tool is available (or you build it from the repo)
     # it will slot in here between runs 2 and 3
 
+    # --- DETERMINISTIC COMPARISON AGAINST GROUND TRUTH ---
+    ground_truth = results[0]
+    for r in results[1:]:
+        r["comparison"] = compare_to_ground_truth(ground_truth, r)
+
     # write all results to a json file in the same folder as this script
     # "w" means write mode — creates the file if it doesn't exist
     # indent=2 makes the json human-readable with 2-space indentation
@@ -170,7 +230,11 @@ if __name__ == "__main__":
     # open the json file to see the headline numbers
     # -------------------------------------------------------
     print("\n--- SUMMARY ---")
-    print(f"{'Run':<45} {'Latency':>10} {'Prompt Tokens':>15} {'Response Tokens':>17}")
-    print("-" * 90)
+    print(f"{'Run':<45} {'Latency':>10} {'Prompt Tokens':>15} {'Response Tokens':>17} {'Score vs GT':>13} {'Missing':>9} {'Mismatch':>10}")
+    print("-" * 122)
     for r in results:
-        print(f"{r['run']:<45} {str(r['latency_seconds']) + 's':>10} {str(r['tokens_prompt']):>15} {str(r['tokens_response']):>17}")
+        cmp = r.get("comparison", {})
+        score    = f"{cmp['score']:.1%}"       if cmp else "— (baseline)"
+        missing  = str(cmp["missing_in_run"])  if cmp else "—"
+        mismatch = str(cmp["mismatches"])      if cmp else "—"
+        print(f"{r['run']:<45} {str(r['latency_seconds']) + 's':>10} {str(r['tokens_prompt']):>15} {str(r['tokens_response']):>17} {score:>13} {missing:>9} {mismatch:>10}")
