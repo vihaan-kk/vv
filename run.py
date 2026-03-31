@@ -1,5 +1,4 @@
 import re
-import requests
 import json
 import time
 import os
@@ -7,13 +6,35 @@ from pathlib import Path
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "qwen3:8b"
 OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "results.json")
-
-
 NDA_SECTION = Path(os.path.join(os.path.dirname(__file__), "nda_section.md")).read_text()
 PROMPT = Path(os.path.join(os.path.dirname(__file__), "prompt.md")).read_text()
+
+# --- BACKEND SELECTION ---
+# set BACKEND=ollama on your Mac, leave unset on Longleaf
+# on Mac: BACKEND=ollama python run.py
+# on Longleaf: python run.py
+BACKEND = os.environ.get("BACKEND", "huggingface")
+
+if BACKEND == "ollama":
+    import requests
+    OLLAMA_URL = "http://localhost:11434/api/generate"
+    OLLAMA_MODEL = "qwen3:8b"
+    print(f"Using Ollama backend ({OLLAMA_MODEL})")
+else:
+    from transformers import pipeline
+    import torch
+    HF_MODEL = "Qwen/Qwen3-8B"
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using HuggingFace backend ({HF_MODEL}) on {DEVICE}")
+    print("Loading model...")
+    pipe = pipeline(
+        "text-generation",
+        model=HF_MODEL,
+        dtype=torch.float16,
+        device_map="auto"
+    )
+    print("Model loaded.")
 
 # --- DETERMINISTIC COMPARISON ---
 # parses the structured output into {field: value} pairs and compares
@@ -71,7 +92,7 @@ def compare_to_ground_truth(ground_truth, run_result):
 
 # --- RUN FUNCTION ---
 # this function takes a label (what to call the run) and a context (what to
-# inject into the prompt), sends it to ollama, and returns a results dict
+# inject into the prompt), sends it to the model, and returns a results dict
 def run(label, context):
     print(f"\nRunning: {label}...")
 
@@ -81,29 +102,43 @@ def run(label, context):
     # record the time before the request
     start = time.time()
 
-    # send the request to ollama
-    # json= means we're sending a python dict as json in the request body
-    response = requests.post(OLLAMA_URL, json={
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,       # wait for the full response before returning
-        "options": {
-            "temperature": 0.1,  # low temperature = more deterministic output
-            "num_ctx": 8192      # context window size in tokens
-        }
-    })
+    if BACKEND == "ollama":
+        # send the request to ollama
+        # json= means we're sending a python dict as json in the request body
+        response = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,       # wait for the full response before returning
+            "options": {
+                "temperature": 0.1,  # low temperature = more deterministic output
+                "num_ctx": 8192      # context window size in tokens
+            }
+        })
+
+        # parse the response body from json into a python dict
+        data = response.json()
+
+        # extract the fields we care about
+        # .get() means "return this key if it exists, otherwise return the default"
+        output = data.get("response", "")
+        tokens_prompt = data.get("prompt_eval_count", "N/A")
+        tokens_response = data.get("eval_count", "N/A")
+
+    else:
+        result = pipe(
+            prompt,
+            max_new_tokens=1024,
+            temperature=0.1,
+            do_sample=True,
+            pad_token_id=pipe.tokenizer.eos_token_id
+        )
+        # strip the input prompt from the output — huggingface returns the full text
+        output = result[0]["generated_text"][len(prompt):]
+        tokens_prompt = len(pipe.tokenizer.encode(prompt))
+        tokens_response = len(pipe.tokenizer.encode(output))
 
     # calculate how many seconds the run took
     elapsed = round(time.time() - start, 2)
-
-    # parse the response body from json into a python dict
-    data = response.json()
-
-    # extract the fields we care about
-    # .get() means "return this key if it exists, otherwise return the default"
-    output = data.get("response", "")
-    tokens_prompt = data.get("prompt_eval_count", "N/A")
-    tokens_response = data.get("eval_count", "N/A")
 
     # print a quick summary to terminal so you can see progress
     print(f"  Done. Latency: {elapsed}s | Prompt tokens: {tokens_prompt} | Response tokens: {tokens_response}")
@@ -143,7 +178,7 @@ def fake_retrieve(chunks, top_k=2):
 def semantic_chunk(text):
     embeddings = HuggingFaceEmbeddings(
         model_name="sentence-transformers/all-MiniLM-L6-v2",
-        model_kwargs={"device": "mps"},          # M4 Metal acceleration
+        model_kwargs={"device": "mps" if BACKEND == "ollama" else DEVICE},
         encode_kwargs={"normalize_embeddings": True}
     )
 
@@ -182,7 +217,8 @@ if __name__ == "__main__":
         baseline_context
     ))
 
-    # RUN 2.5 — SEMANTIC CHUNKING
+    # -------------------------------------------------------
+    # RUN 3 — SEMANTIC CHUNKING
     # uses embedding similarity to detect topic shifts and split there
     # smarter than flat chunking but still flat — no hierarchy awareness
     # this represents the current best practice in most AI tools today
@@ -195,18 +231,6 @@ if __name__ == "__main__":
         "RUN 3 — SEMANTIC CHUNKING (topic-shift, top 2 chunks)",
         semantic_context
     ))
-
-    # -------------------------------------------------------
-    # RUN 3 — CAG (cache augmented generation)
-    # the full document goes into context — no retrieval step
-    # in production this would be preloaded into the kv cache once
-    # and reused across multiple queries in the same session
-    # for the prototype we simulate it by just passing the full text
-    # -------------------------------------------------------
-    # results.append(run(
-    #     "RUN 3 — CAG (full document in context)",
-    #     NDA_SECTION
-    # ))
 
     # NOTE: RUN 4 — RAG (HiChunk + Auto-Merge) comes later
     # once your friend's tool is available (or you build it from the repo)
@@ -224,6 +248,7 @@ if __name__ == "__main__":
         json.dump(results, f, indent=2)
 
     print(f"\nResults saved to: {OUTPUT_FILE}")
+
     # -------------------------------------------------------
     # QUICK COMPARISON SUMMARY
     # prints a compact table to terminal so you don't have to
