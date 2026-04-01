@@ -19,12 +19,12 @@ BACKEND = os.environ.get("BACKEND", "huggingface")
 if BACKEND == "ollama":
     import requests
     OLLAMA_URL = "http://localhost:11434/api/generate"
-    OLLAMA_MODEL = "qwen3:8b"
+    OLLAMA_MODEL = "qwen2.5:7b"
     print(f"Using Ollama backend ({OLLAMA_MODEL})")
 else:
     from transformers import pipeline
     import torch
-    HF_MODEL = "Qwen/Qwen3-8B"
+    HF_MODEL = "Qwen/Qwen2.5-7B-Instruct"
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using HuggingFace backend ({HF_MODEL}) on {DEVICE}")
     print("Loading model...")

@@ -52,4 +52,4 @@ CONTEXT:
 
 QUESTION:
 What are all the conditions under which this agreement can be terminated,
-and what are the obligations of each party upon termination? /no_think
+and what are the obligations of each party upon termination?
