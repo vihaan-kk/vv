@@ -12,5 +12,8 @@
 module purge
 module load anaconda
 
+# Activate the HiChunk conda environment (includes all dependencies)
+conda activate hichunk
+
 cd ~/vv_bench
 python run.py

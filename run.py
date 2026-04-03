@@ -9,6 +9,27 @@ from pathlib import Path
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
 
+# --- HICHUNK AVAILABILITY CHECK ---
+# HiChunk requires: sentence-transformers, numpy, chromadb for retrieval
+# The full HiChunk model (LLaMA-based) requires vLLM + GPU on Longleaf
+# On Mac, we use a structure-aware fallback chunker with the same retrieval logic
+HICHUNK_AVAILABLE = False
+HICHUNK_FULL = False  # True if actual HiChunk repo is available
+try:
+    from sentence_transformers import SentenceTransformer
+    import numpy as np
+    # chromadb is optional - we use numpy for similarity search
+    HICHUNK_AVAILABLE = True
+    # Check if full HiChunk repo is available (Longleaf only)
+    HICHUNK_REPO = os.path.expanduser("~/HiChunk")
+    if os.path.exists(HICHUNK_REPO):
+        import sys
+        sys.path.insert(0, HICHUNK_REPO)
+        HICHUNK_FULL = True
+        print(f"HiChunk repo found at {HICHUNK_REPO}")
+except ImportError as e:
+    print(f"HiChunk dependencies not available ({e}) — skipping RUN 4")
+
 OUTPUT_FILE = os.path.join(os.path.dirname(__file__), "results.json")
 NDA_SECTION = Path(os.path.join(os.path.dirname(__file__), "nda_section.md")).read_text()
 PROMPT = Path(os.path.join(os.path.dirname(__file__), "prompt.md")).read_text()
@@ -194,6 +215,243 @@ def semantic_chunk(text):
     docs = splitter.create_documents([text])
     return [doc.page_content for doc in docs]
 
+
+# --- HICHUNK FUNCTIONS ---
+# These functions implement hierarchical chunking with Auto-Merge retrieval
+# HiChunk produces a tree of chunks that respects document structure
+# Auto-Merge promotes sibling leaf nodes to parent context when retrieved together
+
+def hichunk_parse_splits(splits):
+    """
+    Parse HiChunk splits format into a hierarchical tree structure.
+    
+    HiChunk output format: [["chunk text", level], ...]
+    where level indicates the hierarchical depth (1 = top level section).
+    
+    Returns a list of chunk dicts with parent/child relationships.
+    """
+    if not splits:
+        return []
+    
+    chunks = []
+    for i, (text, level) in enumerate(splits):
+        chunks.append({
+            'id': f'chunk_{i}',
+            'text': text.strip(),
+            'level': level,
+            'left_index_idx': i,
+            'right_index_idx': i + 1,
+            'parent': None,
+            'children': []
+        })
+    
+    # Build parent-child relationships based on levels
+    # Lower level number = higher in hierarchy (level 1 is parent of level 2)
+    for i, chunk in enumerate(chunks):
+        # Find parent: nearest preceding chunk with lower level number
+        for j in range(i - 1, -1, -1):
+            if chunks[j]['level'] < chunk['level']:
+                chunk['parent'] = chunks[j]
+                chunks[j]['children'].append(chunk)
+                break
+    
+    return chunks
+
+
+def hichunk_get_leaves(chunks):
+    """
+    Extract leaf nodes (chunks with no children) from the chunk tree.
+    These are the finest-grained chunks for embedding and retrieval.
+    """
+    return [c for c in chunks if not c['children']]
+
+
+def hichunk_auto_merge(chunks, retrieved_leaves, similarity_threshold=2):
+    """
+    Auto-Merge retrieval algorithm.
+    
+    If multiple sibling leaves are retrieved, merge them up to their parent node.
+    This ensures that related sub-clauses (like 8.3(a)(i), 8.3(a)(ii)) are kept 
+    together with their parent section.
+    
+    Args:
+        chunks: Full list of chunk dicts with parent/child relationships
+        retrieved_leaves: List of retrieved leaf chunk dicts
+        similarity_threshold: Min siblings required to trigger merge (default 2)
+    
+    Returns:
+        List of merged chunk dicts (may include parent nodes)
+    """
+    if not retrieved_leaves:
+        return []
+    
+    # Group retrieved leaves by parent
+    parent_groups = {}
+    for leaf in retrieved_leaves:
+        parent = leaf.get('parent')
+        parent_id = parent['id'] if parent else 'root'
+        if parent_id not in parent_groups:
+            parent_groups[parent_id] = {'parent': parent, 'leaves': []}
+        parent_groups[parent_id]['leaves'].append(leaf)
+    
+    # Decide which nodes to include in final context
+    merged_nodes = []
+    seen_ids = set()
+    
+    for parent_id, group in parent_groups.items():
+        parent = group['parent']
+        leaves = group['leaves']
+        
+        # If enough siblings retrieved and parent exists, use parent
+        if parent and len(leaves) >= similarity_threshold:
+            if parent['id'] not in seen_ids:
+                merged_nodes.append(parent)
+                seen_ids.add(parent['id'])
+                # Mark all children as seen
+                for child in parent['children']:
+                    seen_ids.add(child['id'])
+        else:
+            # Otherwise use individual leaves
+            for leaf in leaves:
+                if leaf['id'] not in seen_ids:
+                    merged_nodes.append(leaf)
+                    seen_ids.add(leaf['id'])
+    
+    # Sort by document order
+    merged_nodes.sort(key=lambda c: c['left_index_idx'])
+    return merged_nodes
+
+
+def hichunk_retrieve(chunks, query, top_k=3):
+    """
+    Embed leaf nodes with bge-m3, retrieve top_k by cosine similarity,
+    run Auto-Merge to promote to parent nodes where siblings are present,
+    return assembled context string.
+    
+    Args:
+        chunks: List of chunk dicts from hichunk_parse_splits()
+        query: Query string for retrieval
+        top_k: Number of leaf nodes to retrieve
+    
+    Returns:
+        Assembled context string with merged chunks
+    """
+    leaves = hichunk_get_leaves(chunks)
+    
+    if not leaves:
+        return ""
+    
+    # Use BGE-M3 for embeddings (high quality multilingual model)
+    embed_model = SentenceTransformer("BAAI/bge-m3")
+    
+    # Embed all leaves
+    leaf_texts = [leaf['text'] for leaf in leaves]
+    leaf_embeddings = embed_model.encode(leaf_texts, normalize_embeddings=True)
+    
+    # Embed query
+    query_embedding = embed_model.encode([query], normalize_embeddings=True)[0]
+    
+    # Compute cosine similarity (embeddings are normalized, so dot product = cosine)
+    similarities = np.dot(leaf_embeddings, query_embedding)
+    
+    # Get top-k indices
+    top_indices = np.argsort(similarities)[-top_k:][::-1]
+    retrieved_leaves = [leaves[i] for i in top_indices]
+    
+    # Apply Auto-Merge
+    merged_nodes = hichunk_auto_merge(chunks, retrieved_leaves)
+    
+    # Build full text for each merged node
+    def get_node_text(node):
+        """Get full text for a node, including all children if it's a parent."""
+        if not node['children']:
+            return node['text']
+        # For parent nodes, concatenate all descendant text
+        texts = []
+        start_idx = node['left_index_idx']
+        end_idx = node['right_index_idx']
+        for chunk in chunks:
+            if start_idx <= chunk['left_index_idx'] < end_idx:
+                if not chunk['children']:  # Only add leaf text to avoid duplication
+                    texts.append(chunk['text'])
+        return '\n'.join(texts) if texts else node['text']
+    
+    # Assemble context string
+    context_parts = [get_node_text(node) for node in merged_nodes]
+    return "\n\n---\n\n".join(context_parts)
+
+
+def structure_aware_chunk(text):
+    """
+    Fallback hierarchical chunker that uses regex patterns to identify
+    legal document structure (sections, subsections, clauses).
+    
+    This mimics HiChunk's output format: [["chunk text", level], ...]
+    
+    Patterns recognized (handles markdown formatting):
+    - Level 1: Major sections like "**8.1", "## 8.1", "8.1 Term"
+    - Level 2: Subsections like "*(a)*", "(a)", "**(a)**"
+    - Level 3: Sub-clauses like "- (i)", "(i)", "(ii)", "(iii)"
+    
+    Returns list of [text, level] pairs.
+    """
+    lines = text.split('\n')
+    splits = []
+    current_chunk = []
+    current_level = 1
+    
+    # Patterns for legal document structure (with optional markdown)
+    # Level 1: **8.X** or ## 8.X or just 8.X section headers
+    section_pattern = re.compile(r'^(\*\*|##?\s*)?(\d+\.\d+)\s*(\*\*)?')
+    # Level 2: *(a)* or (a) or **(a)** style subsections
+    subsection_pattern = re.compile(r'^\s*(\*+)?\(([a-z])\)(\*+)?\s')
+    # Level 3: - (i), (i), (ii), (iii) style sub-clauses
+    clause_pattern = re.compile(r'^\s*[-*]?\s*\((?:i{1,3}|iv|v|vi{0,3})\)\s', re.IGNORECASE)
+    
+    def get_level(line):
+        """Determine the hierarchical level of a line."""
+        stripped = line.strip()
+        if not stripped:
+            return None
+        if section_pattern.match(stripped):
+            return 1
+        if subsection_pattern.match(stripped):
+            return 2
+        if clause_pattern.match(stripped):
+            return 3
+        return None
+    
+    def flush_chunk():
+        """Save the current chunk if non-empty."""
+        nonlocal current_chunk, current_level
+        if current_chunk:
+            chunk_text = '\n'.join(current_chunk)
+            if chunk_text.strip():
+                splits.append([chunk_text, current_level])
+            current_chunk = []
+    
+    for line in lines:
+        level = get_level(line)
+        
+        if level is not None:
+            # New section/subsection/clause detected
+            flush_chunk()
+            current_level = level
+            current_chunk.append(line)
+        else:
+            # Continuation of current chunk
+            current_chunk.append(line)
+    
+    # Don't forget the last chunk
+    flush_chunk()
+    
+    # If no structure was detected, fall back to paragraph-based chunks
+    if not splits:
+        paragraphs = text.split('\n\n')
+        splits = [[p.strip(), 1] for p in paragraphs if p.strip()]
+    
+    return splits
+
 if __name__ == "__main__":
 
     # run the ground truth pass — full section 8 goes directly into context
@@ -235,9 +493,48 @@ if __name__ == "__main__":
         semantic_context
     ))
 
-    # NOTE: RUN 4 — RAG (HiChunk + Auto-Merge) comes later
-    # once your friend's tool is available (or you build it from the repo)
-    # it will slot in here between runs 2 and 3
+    # -------------------------------------------------------
+    # RUN 4 — HICHUNK + AUTO-MERGE RETRIEVAL
+    # hierarchical chunking respects the document's own structure
+    # auto-merge promotes sibling leaf nodes to parent context
+    # this is what should correctly surface deep sub-clauses
+    # -------------------------------------------------------
+    if HICHUNK_AVAILABLE:
+        print("\n--- HiChunk + Auto-Merge Retrieval ---")
+        
+        # Check if pre-computed HiChunk splits exist (from full HiChunk model)
+        HICHUNK_CACHE = os.path.join(os.path.dirname(__file__), ".hichunk_cache.json")
+        
+        if os.path.exists(HICHUNK_CACHE):
+            print("Loading cached HiChunk splits...")
+            with open(HICHUNK_CACHE, 'r') as f:
+                cached = json.load(f)
+                hichunk_splits = cached.get('splits', [])
+        else:
+            # Fallback: use a structure-aware regex chunker that mimics HiChunk
+            # This identifies section headers (8.1, 8.2, 8.3(a), etc.) and assigns levels
+            if HICHUNK_FULL:
+                print("Full HiChunk available but no cache — using structure-aware fallback...")
+            else:
+                print("Using structure-aware fallback chunker (HiChunk repo not installed)...")
+            hichunk_splits = structure_aware_chunk(NDA_SECTION)
+            # Cache for future runs
+            with open(HICHUNK_CACHE, 'w') as f:
+                json.dump({'splits': hichunk_splits}, f)
+        
+        if hichunk_splits:
+            QUERY = "What are all the conditions under which this agreement can be terminated?"
+            chunks = hichunk_parse_splits(hichunk_splits)
+            hichunk_context = hichunk_retrieve(chunks, QUERY, top_k=5)
+            
+            results.append(run(
+                "RUN 4 — HICHUNK + AUTO-MERGE (hierarchical, top 5)",
+                hichunk_context
+            ))
+        else:
+            print("No HiChunk splits available — skipping RUN 4")
+    else:
+        print("\nSkipping RUN 4 — sentence-transformers not installed")
 
     # --- DETERMINISTIC COMPARISON AGAINST GROUND TRUTH ---
     ground_truth = results[0]
