@@ -80,54 +80,87 @@ def parse_output(output):
 # Uses the same LLM to evaluate semantic equivalence between expected/actual answers
 # More accurate than string matching — handles formatting differences, paraphrasing, etc.
 
-LLM_JUDGE_PROMPT = """You are evaluating a legal clause extraction system. Your job is to assess whether an extracted answer captures the correct legal meaning, regardless of phrasing differences.
+LLM_JUDGE_PROMPT = """You are evaluating a legal clause extraction system. Your job has two parts:
+(1) assess whether the model used its retrieved context well, and
+(2) determine whether the retriever actually gave the model what it needed.
+
+These are separate questions and must be scored separately.
 
 You will be given:
-- The source context (the actual text the system had access to)
+- The source context (the exact text the model had access to)
 - A field name describing what was being extracted
 - The expected answer (ground truth)
-- The extracted answer (what the system produced)
+- The extracted answer (what the model produced)
 
 ---
 
-Score the extraction on the following scale:
+STEP 1 — RETRIEVAL CHECK (do this first, before scoring)
+
+Read the source context carefully. Ask: does the source context contain enough
+information to answer this field correctly?
+
+- If YES → the model had what it needed. Score the extraction normally (Steps 2–3).
+- If NO  → this is a retrieval gap. Set gap_is_retrieval_fault: true.
+           Then ask: did the model correctly identify the gap?
+           If the model said [NOT FOUND] or [AMBIGUOUS] → correct_gap, score 1.0
+           If the model hallucinated an answer anyway   → hallucinated, score 0.0
+
+Do not reward a model for saying [NOT FOUND] when the answer was actually in the context.
+Do not penalize a model for saying [NOT FOUND] when the answer was genuinely absent.
+
+---
+
+STEP 2 — EXTRACTION SCORE (only when context contained the answer)
+
+Score on this scale:
 
 1.0 — Correct and complete
-  The extracted answer conveys the same legal meaning as the expected answer.
-  Minor wording differences, tense changes, added preamble, or trailing punctuation do NOT reduce this score.
-  Example: "is reduced" vs "shall be reduced" → 1.0
-  Example: "Notwithstanding § 8.5(a), the Receiving Party may retain..." vs "The Receiving Party may retain..." → 1.0
+  Same legal meaning as the expected answer. Minor wording differences, tense
+  changes, added preamble, or trailing punctuation do NOT reduce this score.
+  Examples that should score 1.0:
+  - "is reduced" vs "shall be reduced"
+  - "Notwithstanding § 8.5(a), the Receiving Party may retain..." vs "The Receiving Party may retain..."
+  - Full verbatim sentence when only the key phrase was expected, if no meaning is lost
 
-0.7 — Correct but over- or under-extracted
-  The core legal meaning is present but the answer includes significant surrounding text that
-  obscures the specific answer, OR omits minor detail that does not change the legal outcome.
-  Example: returning a full verbatim paragraph when only the deadline ("10 business days") was asked for → 0.7
-  Example: "Successive one-year periods" when expected "This Agreement shall automatically renew for successive one-year periods" → 0.7
+0.7 — Correct but imprecise
+  Core legal meaning is present but the answer is notably over- or under-extracted
+  in a way that would require a reader to do work to find the specific answer.
+  Examples:
+  - Returning a full multi-sentence paragraph when only "10 business days" was asked for
+  - "Successive one-year periods" when expected "This Agreement shall automatically renew
+    for successive one-year periods" (correct but stripped of operative verb)
 
 0.4 — Partially correct
-  The answer captures some but not all of the required legal meaning. Key terms, conditions,
-  or qualifications are missing or wrong in a way that would matter legally.
-  Example: "Section 3 (Confidentiality)" when the full list is § 3, § 8.5, § 8.6, § 9, § 10, § 11 → 0.4
+  Captures some but not all of the required legal meaning. Missing conditions,
+  qualifications, or list items that would matter legally.
+  Example: "Section 3 (Confidentiality)" when the full list is
+  § 3, § 8.5, § 8.6, § 9, § 10, § 11
 
-0.0 — Wrong or missing
-  The answer is absent ([NOT FOUND]), is a hallucination, or conveys incorrect legal meaning.
-  Note: if the source context does not contain the information, a [NOT FOUND] answer is correct
-  and should be scored based on whether that is accurate given the source context.
+0.0 — Wrong or hallucinated
+  Asserts something not in the source context, or conveys incorrect legal meaning.
+  Note: [AMBIGUOUS] is not automatically 0.0 — if the context is genuinely ambiguous
+  on this point, [AMBIGUOUS] may be correct. Check the source context first.
 
 ---
 
-Watch for these specific failure patterns and handle them carefully:
+STEP 3 — SELF-CONTRADICTION CHECK
 
-SELF-CONTRADICTION: If the extracted answer contains the correct information but also tags itself
-  [NOT FOUND] or [AMBIGUOUS], treat the correct information as the answer and score accordingly.
-  Do not penalize for the tag if the substance is right.
+If the extracted answer contains the correct information but also tags itself
+[NOT FOUND] or [AMBIGUOUS], treat the substantive content as the answer and
+score that. Do not penalize for the tag if the substance is correct.
 
-CONTEXT-APPROPRIATE GAPS: If the source context does not contain the information needed to answer
-  the field, and the system responded [NOT FOUND] or [AMBIGUOUS], this is a CORRECT response.
-  Score it 1.0 and set "gap_is_retrieval_fault" to true.
+Example: "60 days before end of term. [NOT FOUND]" → score the "60 days" part.
 
-HALLUCINATION: If the extracted answer asserts something that is not in the source context and
-  is not in the expected answer, flag it. This is more serious than a missing answer.
+---
+
+STEP 4 — HALLUCINATION CHECK
+
+Flag hallucinated: true if the model asserts a specific fact that:
+- is not present in the source context, AND
+- is not in the expected answer
+
+A [NOT FOUND] or [AMBIGUOUS] response is never a hallucination.
+An answer that adds preamble from the source text is not a hallucination.
 
 ---
 
@@ -153,11 +186,16 @@ Extracted answer:
 Respond with valid JSON only. No preamble, no explanation outside the JSON.
 
 {
-  "score": float,              // 0.0, 0.4, 0.7, or 1.0
-  "reasoning": string,         // one sentence explaining the score
-  "hallucinated": boolean,     // true if the extracted answer asserts something not in the source context
-  "gap_is_retrieval_fault": boolean,  // true if the field was unanswerable given the source context
-  "category": string           // one of: "correct", "cosmetic_difference", "over_extracted", "under_extracted", "partial", "missing", "hallucinated", "correct_gap"
+  "gap_is_retrieval_fault": boolean,   // true if source context lacked the information
+  "score": float,                      // 0.0, 0.4, 0.7, or 1.0
+  "retrieval_adjusted_score": float,   // same as score if gap_is_retrieval_fault is false;
+                                       // null if gap_is_retrieval_fault is true
+                                       // (excluded from retrieval-adjusted aggregate)
+  "reasoning": string,                 // one sentence explaining the score
+  "hallucinated": boolean,
+  "category": string                   // one of: "correct", "correct_gap", "over_extracted",
+                                       // "under_extracted", "partial", "missing",
+                                       // "hallucinated"
 }"""
 
 
@@ -221,6 +259,31 @@ def llm_judge(field, expected, actual, chunk_text=""):
         }
 
 
+def retrieval_adjusted_score(judge_results):
+    """
+    Only score fields where the retriever actually provided the content.
+    This separates retrieval quality from extraction quality.
+    """
+    answerable = [r for r in judge_results if not r.get("gap_is_retrieval_fault", False)]
+    
+    if not answerable:
+        return None  # retriever provided nothing — score is meaningless
+    
+    return sum(r["score"] for r in answerable) / len(answerable)
+
+
+def retrieval_coverage(judge_results):
+    """
+    How much of the document did the retriever actually surface?
+    Returns fraction of fields that were answerable given the retrieved context.
+    """
+    if not judge_results:
+        return 0.0
+    total = len(judge_results)
+    gaps = sum(1 for r in judge_results if r.get("gap_is_retrieval_fault", False))
+    return (total - gaps) / total
+
+
 def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
     """Compare a run's parsed output against the ground truth field by field."""
     gt_fields = parse_output(ground_truth["output"])
@@ -262,7 +325,9 @@ def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
                 "field": field,
                 "score": 1.0,
                 "reasoning": "Exact match",
-                "category": "correct"
+                "category": "correct",
+                "gap_is_retrieval_fault": False,
+                "hallucinated": False
             })
         else:
             # Not an exact match — use LLM to judge semantic equivalence
@@ -283,6 +348,10 @@ def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
 
     exact_score = round(exact_matches / total_fields, 3) if total_fields > 0 else 0
     llm_score = round(weighted_score / total_fields, 3) if total_fields > 0 else 0
+    
+    # Compute retrieval-adjusted metrics
+    adj_score = retrieval_adjusted_score(judge_results)
+    coverage = retrieval_coverage(judge_results)
 
     return {
         "compared_to": ground_truth["run"],
@@ -294,6 +363,8 @@ def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
         "retrieval_gaps": retrieval_gaps,
         "exact_score": exact_score,
         "llm_score": llm_score,
+        "retrieval_adjusted_score": round(adj_score, 3) if adj_score is not None else None,
+        "retrieval_coverage": round(coverage, 3),
         "details": {
             "missing": missing,
             "mismatches": mismatches,
@@ -742,20 +813,18 @@ if __name__ == "__main__":
     # open the json file to see the headline numbers
     # -------------------------------------------------------
     print("\n--- SUMMARY ---")
-    print(f"{'Run':<50} {'Latency':>8} {'Exact':>8} {'LLM':>8} {'Missing':>9} {'Halluc':>8} {'Gaps':>6}")
-    print("-" * 100)
+    print(f"{'Run':<50} {'Latency':>8} {'LLM':>8} {'Adj':>8} {'Coverage':>10} {'Halluc':>8}")
+    print("-" * 95)
     for r in results:
         cmp = r.get("comparison", {})
         if cmp:
-            exact    = f"{cmp['exact_score']:.1%}"
             llm      = f"{cmp['llm_score']:.1%}"
-            missing  = str(cmp["missing_in_run"])
+            adj      = f"{cmp['retrieval_adjusted_score']:.1%}" if cmp['retrieval_adjusted_score'] is not None else "N/A"
+            coverage = f"{cmp['retrieval_coverage']:.1%}"
             halluc   = str(cmp["hallucinations"])
-            gaps     = str(cmp["retrieval_gaps"])
         else:
-            exact = "—"
             llm = "(baseline)"
-            missing = "—"
+            adj = "—"
+            coverage = "—"
             halluc = "—"
-            gaps = "—"
-        print(f"{r['run']:<50} {str(r['latency_seconds']) + 's':>8} {exact:>8} {llm:>8} {missing:>9} {halluc:>8} {gaps:>6}")
+        print(f"{r['run']:<50} {str(r['latency_seconds']) + 's':>8} {llm:>8} {adj:>8} {coverage:>10} {halluc:>8}")
