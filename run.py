@@ -1,7 +1,10 @@
+import os
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+
 import re
 import json
 import time
-import os
 from pathlib import Path
 from langchain_experimental.text_splitter import SemanticChunker
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -28,8 +31,6 @@ else:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using HuggingFace backend ({HF_MODEL}) on {DEVICE}")
     print("Loading model...")
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_OFFLINE"] = "1"
     pipe = pipeline(
         "text-generation",
         model=HF_MODEL,
