@@ -28,12 +28,12 @@ else:
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using HuggingFace backend ({HF_MODEL}) on {DEVICE}")
     print("Loading model...")
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
     pipe = pipeline(
         "text-generation",
         model=HF_MODEL,
         dtype=torch.float16,
-        device_map="auto",
-        local_files_only=True
+        device_map="auto"
     )
     print("Model loaded.")
 
