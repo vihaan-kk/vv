@@ -32,7 +32,8 @@ else:
         "text-generation",
         model=HF_MODEL,
         dtype=torch.float16,
-        device_map="auto"
+        device_map="auto",
+        local_files_only=True
     )
     print("Model loaded.")
 
