@@ -75,7 +75,57 @@ def parse_output(output):
             fields[key] = value
     return fields
 
-def compare_to_ground_truth(ground_truth, run_result):
+
+# --- LLM-AS-JUDGE ---
+# Uses the same LLM to evaluate semantic equivalence between expected/actual answers
+# More accurate than string matching — handles formatting differences, paraphrasing, etc.
+
+LLM_JUDGE_PROMPT = """You are evaluating whether two answers are semantically equivalent.
+
+Field: {field}
+Expected answer: {expected}
+Actual answer: {actual}
+
+Are these answers semantically equivalent? Consider:
+- Minor formatting differences (periods, prefixes like (a)/(b)) should be ignored
+- Extra context that doesn't contradict the expected answer is acceptable
+- The core meaning and facts must match
+
+Respond with ONLY one word: YES or NO"""
+
+
+def llm_judge(field, expected, actual):
+    """
+    Ask the LLM whether two answers are semantically equivalent.
+    Returns True if equivalent, False otherwise.
+    """
+    prompt = LLM_JUDGE_PROMPT.format(field=field, expected=expected, actual=actual)
+    
+    if BACKEND == "ollama":
+        response = requests.post(OLLAMA_URL, json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.0,  # deterministic
+                "num_ctx": 2048
+            }
+        })
+        answer = response.json().get("response", "").strip().upper()
+    else:
+        result = pipe(
+            prompt,
+            max_new_tokens=10,
+            temperature=0.0,
+            do_sample=False,
+            pad_token_id=pipe.tokenizer.eos_token_id
+        )
+        answer = result[0]["generated_text"][len(prompt):].strip().upper()
+    
+    return answer.startswith("YES")
+
+
+def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
     """Compare a run's parsed output against the ground truth field by field."""
     gt_fields = parse_output(ground_truth["output"])
     run_fields = parse_output(run_result["output"])
@@ -83,6 +133,7 @@ def compare_to_ground_truth(ground_truth, run_result):
     missing = []     # GT has a value, run has [NOT FOUND]
     mismatches = []  # Both have values but they differ
     exact_matches = 0
+    semantic_matches = 0  # LLM judged as equivalent
 
     for field, gt_value in gt_fields.items():
         run_value = run_fields.get(field, "[NOT FOUND]")
@@ -95,19 +146,42 @@ def compare_to_ground_truth(ground_truth, run_result):
             missing.append({"field": field, "expected": gt_value})
         elif gt_value.lower().strip() == run_value.lower().strip():
             exact_matches += 1
+            semantic_matches += 1  # exact match is also a semantic match
         else:
-            mismatches.append({"field": field, "expected": gt_value, "actual": run_value})
+            # Not an exact match — use LLM to judge semantic equivalence
+            if use_llm_judge:
+                is_equivalent = llm_judge(field, gt_value, run_value)
+                if is_equivalent:
+                    semantic_matches += 1
+                    mismatches.append({
+                        "field": field, 
+                        "expected": gt_value, 
+                        "actual": run_value,
+                        "llm_judge": "EQUIVALENT"
+                    })
+                else:
+                    mismatches.append({
+                        "field": field, 
+                        "expected": gt_value, 
+                        "actual": run_value,
+                        "llm_judge": "DIFFERENT"
+                    })
+            else:
+                mismatches.append({"field": field, "expected": gt_value, "actual": run_value})
 
     gt_fields_with_value = sum(1 for v in gt_fields.values() if v != "[NOT FOUND]")
-    score = round(exact_matches / gt_fields_with_value, 3) if gt_fields_with_value > 0 else 0
+    exact_score = round(exact_matches / gt_fields_with_value, 3) if gt_fields_with_value > 0 else 0
+    semantic_score = round(semantic_matches / gt_fields_with_value, 3) if gt_fields_with_value > 0 else 0
 
     return {
         "compared_to": ground_truth["run"],
         "gt_fields_with_value": gt_fields_with_value,
         "exact_matches": exact_matches,
+        "semantic_matches": semantic_matches,
         "missing_in_run": len(missing),
         "mismatches": len(mismatches),
-        "score": score,
+        "exact_score": exact_score,
+        "semantic_score": semantic_score,
         "details": {
             "missing": missing,
             "mismatches": mismatches
@@ -555,11 +629,18 @@ if __name__ == "__main__":
     # open the json file to see the headline numbers
     # -------------------------------------------------------
     print("\n--- SUMMARY ---")
-    print(f"{'Run':<45} {'Latency':>10} {'Prompt Tokens':>15} {'Response Tokens':>17} {'Score vs GT':>13} {'Missing':>9} {'Mismatch':>10}")
-    print("-" * 122)
+    print(f"{'Run':<50} {'Latency':>8} {'Exact':>8} {'Semantic':>10} {'Missing':>9} {'Mismatch':>10}")
+    print("-" * 100)
     for r in results:
         cmp = r.get("comparison", {})
-        score    = f"{cmp['score']:.1%}"       if cmp else "— (baseline)"
-        missing  = str(cmp["missing_in_run"])  if cmp else "—"
-        mismatch = str(cmp["mismatches"])      if cmp else "—"
-        print(f"{r['run']:<45} {str(r['latency_seconds']) + 's':>10} {str(r['tokens_prompt']):>15} {str(r['tokens_response']):>17} {score:>13} {missing:>9} {mismatch:>10}")
+        if cmp:
+            exact    = f"{cmp['exact_score']:.1%}"
+            semantic = f"{cmp['semantic_score']:.1%}"
+            missing  = str(cmp["missing_in_run"])
+            mismatch = str(cmp["mismatches"])
+        else:
+            exact = "—"
+            semantic = "(baseline)"
+            missing = "—"
+            mismatch = "—"
+        print(f"{r['run']:<50} {str(r['latency_seconds']) + 's':>8} {exact:>8} {semantic:>10} {missing:>9} {mismatch:>10}")
