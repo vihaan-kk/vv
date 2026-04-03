@@ -186,16 +186,11 @@ Extracted answer:
 Respond with valid JSON only. No preamble, no explanation outside the JSON.
 
 {
-  "gap_is_retrieval_fault": boolean,   // true if source context lacked the information
-  "score": float,                      // 0.0, 0.4, 0.7, or 1.0
-  "retrieval_adjusted_score": float,   // same as score if gap_is_retrieval_fault is false;
-                                       // null if gap_is_retrieval_fault is true
-                                       // (excluded from retrieval-adjusted aggregate)
-  "reasoning": string,                 // one sentence explaining the score
-  "hallucinated": boolean,
-  "category": string                   // one of: "correct", "correct_gap", "over_extracted",
-                                       // "under_extracted", "partial", "missing",
-                                       // "hallucinated"
+  "score": float,              // 0.0, 0.4, 0.7, or 1.0
+  "reasoning": string,         // one sentence explaining the score
+  "hallucinated": boolean,     // true if the extracted answer asserts something not in the source context
+  "gap_is_retrieval_fault": boolean,  // true if the field was unanswerable given the source context
+  "category": string           // one of: "correct", "cosmetic_difference", "over_extracted", "under_extracted", "partial", "missing", "hallucinated", "correct_gap"
 }"""
 
 
