@@ -29,6 +29,7 @@ else:
     print(f"Using HuggingFace backend ({HF_MODEL}) on {DEVICE}")
     print("Loading model...")
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
+    os.environ["HF_HUB_OFFLINE"] = "1"
     pipe = pipeline(
         "text-generation",
         model=HF_MODEL,
