@@ -185,13 +185,13 @@ Extracted answer:
 
 Respond with valid JSON only. No preamble, no explanation outside the JSON.
 
-{
+{{
   "score": float,              // 0.0, 0.4, 0.7, or 1.0
   "reasoning": string,         // one sentence explaining the score
   "hallucinated": boolean,     // true if the extracted answer asserts something not in the source context
   "gap_is_retrieval_fault": boolean,  // true if the field was unanswerable given the source context
   "category": string           // one of: "correct", "cosmetic_difference", "over_extracted", "under_extracted", "partial", "missing", "hallucinated", "correct_gap"
-}"""
+}}"""
 
 
 def llm_judge(field, expected, actual, chunk_text=""):
