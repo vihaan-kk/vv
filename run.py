@@ -80,26 +80,98 @@ def parse_output(output):
 # Uses the same LLM to evaluate semantic equivalence between expected/actual answers
 # More accurate than string matching — handles formatting differences, paraphrasing, etc.
 
-LLM_JUDGE_PROMPT = """You are evaluating whether two answers are semantically equivalent.
+LLM_JUDGE_PROMPT = """You are evaluating a legal clause extraction system. Your job is to assess whether an extracted answer captures the correct legal meaning, regardless of phrasing differences.
 
-Field: {field}
-Expected answer: {expected}
-Actual answer: {actual}
+You will be given:
+- The source context (the actual text the system had access to)
+- A field name describing what was being extracted
+- The expected answer (ground truth)
+- The extracted answer (what the system produced)
 
-Are these answers semantically equivalent? Consider:
-- Minor formatting differences (periods, prefixes like (a)/(b)) should be ignored
-- Extra context that doesn't contradict the expected answer is acceptable
-- The core meaning and facts must match
+---
 
-Respond with ONLY one word: YES or NO"""
+Score the extraction on the following scale:
+
+1.0 — Correct and complete
+  The extracted answer conveys the same legal meaning as the expected answer.
+  Minor wording differences, tense changes, added preamble, or trailing punctuation do NOT reduce this score.
+  Example: "is reduced" vs "shall be reduced" → 1.0
+  Example: "Notwithstanding § 8.5(a), the Receiving Party may retain..." vs "The Receiving Party may retain..." → 1.0
+
+0.7 — Correct but over- or under-extracted
+  The core legal meaning is present but the answer includes significant surrounding text that
+  obscures the specific answer, OR omits minor detail that does not change the legal outcome.
+  Example: returning a full verbatim paragraph when only the deadline ("10 business days") was asked for → 0.7
+  Example: "Successive one-year periods" when expected "This Agreement shall automatically renew for successive one-year periods" → 0.7
+
+0.4 — Partially correct
+  The answer captures some but not all of the required legal meaning. Key terms, conditions,
+  or qualifications are missing or wrong in a way that would matter legally.
+  Example: "Section 3 (Confidentiality)" when the full list is § 3, § 8.5, § 8.6, § 9, § 10, § 11 → 0.4
+
+0.0 — Wrong or missing
+  The answer is absent ([NOT FOUND]), is a hallucination, or conveys incorrect legal meaning.
+  Note: if the source context does not contain the information, a [NOT FOUND] answer is correct
+  and should be scored based on whether that is accurate given the source context.
+
+---
+
+Watch for these specific failure patterns and handle them carefully:
+
+SELF-CONTRADICTION: If the extracted answer contains the correct information but also tags itself
+  [NOT FOUND] or [AMBIGUOUS], treat the correct information as the answer and score accordingly.
+  Do not penalize for the tag if the substance is right.
+
+CONTEXT-APPROPRIATE GAPS: If the source context does not contain the information needed to answer
+  the field, and the system responded [NOT FOUND] or [AMBIGUOUS], this is a CORRECT response.
+  Score it 1.0 and set "gap_is_retrieval_fault" to true.
+
+HALLUCINATION: If the extracted answer asserts something that is not in the source context and
+  is not in the expected answer, flag it. This is more serious than a missing answer.
+
+---
+
+Source context:
+<context>
+{chunk_text}
+</context>
+
+Field: {field_name}
+
+Expected answer:
+<expected>
+{ground_truth}
+</expected>
+
+Extracted answer:
+<extracted>
+{run_output}
+</extracted>
+
+---
+
+Respond with valid JSON only. No preamble, no explanation outside the JSON.
+
+{
+  "score": float,              // 0.0, 0.4, 0.7, or 1.0
+  "reasoning": string,         // one sentence explaining the score
+  "hallucinated": boolean,     // true if the extracted answer asserts something not in the source context
+  "gap_is_retrieval_fault": boolean,  // true if the field was unanswerable given the source context
+  "category": string           // one of: "correct", "cosmetic_difference", "over_extracted", "under_extracted", "partial", "missing", "hallucinated", "correct_gap"
+}"""
 
 
-def llm_judge(field, expected, actual):
+def llm_judge(field, expected, actual, chunk_text=""):
     """
-    Ask the LLM whether two answers are semantically equivalent.
-    Returns True if equivalent, False otherwise.
+    Ask the LLM to evaluate semantic equivalence between expected and actual answers.
+    Returns a dict with score, reasoning, and other metadata from the judge.
     """
-    prompt = LLM_JUDGE_PROMPT.format(field=field, expected=expected, actual=actual)
+    prompt = LLM_JUDGE_PROMPT.format(
+        chunk_text=chunk_text if chunk_text else "[Full document context]",
+        field_name=field,
+        ground_truth=expected,
+        run_output=actual
+    )
     
     if BACKEND == "ollama":
         response = requests.post(OLLAMA_URL, json={
@@ -108,32 +180,61 @@ def llm_judge(field, expected, actual):
             "stream": False,
             "options": {
                 "temperature": 0.0,  # deterministic
-                "num_ctx": 2048
+                "num_ctx": 4096
             }
         })
-        answer = response.json().get("response", "").strip().upper()
+        answer = response.json().get("response", "").strip()
     else:
         result = pipe(
             prompt,
-            max_new_tokens=10,
+            max_new_tokens=256,
             temperature=0.0,
             do_sample=False,
             pad_token_id=pipe.tokenizer.eos_token_id
         )
-        answer = result[0]["generated_text"][len(prompt):].strip().upper()
+        answer = result[0]["generated_text"][len(prompt):].strip()
     
-    return answer.startswith("YES")
+    # Parse JSON response from judge
+    try:
+        # Handle potential markdown code blocks
+        if "```json" in answer:
+            answer = answer.split("```json")[1].split("```")[0].strip()
+        elif "```" in answer:
+            answer = answer.split("```")[1].split("```")[0].strip()
+        
+        judge_result = json.loads(answer)
+        return {
+            "score": judge_result.get("score", 0.0),
+            "reasoning": judge_result.get("reasoning", ""),
+            "hallucinated": judge_result.get("hallucinated", False),
+            "gap_is_retrieval_fault": judge_result.get("gap_is_retrieval_fault", False),
+            "category": judge_result.get("category", "unknown")
+        }
+    except (json.JSONDecodeError, IndexError):
+        # Fallback if JSON parsing fails
+        return {
+            "score": 0.0,
+            "reasoning": f"Failed to parse judge response: {answer[:100]}",
+            "hallucinated": False,
+            "gap_is_retrieval_fault": False,
+            "category": "parse_error"
+        }
 
 
 def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
     """Compare a run's parsed output against the ground truth field by field."""
     gt_fields = parse_output(ground_truth["output"])
     run_fields = parse_output(run_result["output"])
+    chunk_text = run_result.get("context_used", "")
 
     missing = []     # GT has a value, run has [NOT FOUND]
     mismatches = []  # Both have values but they differ
     exact_matches = 0
-    semantic_matches = 0  # LLM judged as equivalent
+    weighted_score = 0.0  # Sum of LLM judge scores
+    total_fields = 0
+    hallucinations = 0
+    retrieval_gaps = 0
+    judge_results = []  # Detailed per-field results
 
     for field, gt_value in gt_fields.items():
         run_value = run_fields.get(field, "[NOT FOUND]")
@@ -142,49 +243,61 @@ def compare_to_ground_truth(ground_truth, run_result, use_llm_judge=True):
 
         if gt_not_found:
             continue  # GT itself didn't find this — not a fair comparison point
-        elif run_not_found:
+        
+        total_fields += 1
+        
+        if run_not_found:
+            # Use LLM judge to check if this is a retrieval gap
+            if use_llm_judge:
+                judge = llm_judge(field, gt_value, run_value, chunk_text)
+                judge_results.append({"field": field, **judge})
+                weighted_score += judge["score"]
+                if judge["gap_is_retrieval_fault"]:
+                    retrieval_gaps += 1
             missing.append({"field": field, "expected": gt_value})
         elif gt_value.lower().strip() == run_value.lower().strip():
             exact_matches += 1
-            semantic_matches += 1  # exact match is also a semantic match
+            weighted_score += 1.0
+            judge_results.append({
+                "field": field,
+                "score": 1.0,
+                "reasoning": "Exact match",
+                "category": "correct"
+            })
         else:
             # Not an exact match — use LLM to judge semantic equivalence
             if use_llm_judge:
-                is_equivalent = llm_judge(field, gt_value, run_value)
-                if is_equivalent:
-                    semantic_matches += 1
-                    mismatches.append({
-                        "field": field, 
-                        "expected": gt_value, 
-                        "actual": run_value,
-                        "llm_judge": "EQUIVALENT"
-                    })
-                else:
-                    mismatches.append({
-                        "field": field, 
-                        "expected": gt_value, 
-                        "actual": run_value,
-                        "llm_judge": "DIFFERENT"
-                    })
+                judge = llm_judge(field, gt_value, run_value, chunk_text)
+                judge_results.append({"field": field, **judge})
+                weighted_score += judge["score"]
+                if judge["hallucinated"]:
+                    hallucinations += 1
+                mismatches.append({
+                    "field": field, 
+                    "expected": gt_value, 
+                    "actual": run_value,
+                    "llm_judge": judge
+                })
             else:
                 mismatches.append({"field": field, "expected": gt_value, "actual": run_value})
 
-    gt_fields_with_value = sum(1 for v in gt_fields.values() if v != "[NOT FOUND]")
-    exact_score = round(exact_matches / gt_fields_with_value, 3) if gt_fields_with_value > 0 else 0
-    semantic_score = round(semantic_matches / gt_fields_with_value, 3) if gt_fields_with_value > 0 else 0
+    exact_score = round(exact_matches / total_fields, 3) if total_fields > 0 else 0
+    llm_score = round(weighted_score / total_fields, 3) if total_fields > 0 else 0
 
     return {
         "compared_to": ground_truth["run"],
-        "gt_fields_with_value": gt_fields_with_value,
+        "total_fields": total_fields,
         "exact_matches": exact_matches,
-        "semantic_matches": semantic_matches,
         "missing_in_run": len(missing),
         "mismatches": len(mismatches),
+        "hallucinations": hallucinations,
+        "retrieval_gaps": retrieval_gaps,
         "exact_score": exact_score,
-        "semantic_score": semantic_score,
+        "llm_score": llm_score,
         "details": {
             "missing": missing,
-            "mismatches": mismatches
+            "mismatches": mismatches,
+            "judge_results": judge_results
         }
     }
 
@@ -629,18 +742,20 @@ if __name__ == "__main__":
     # open the json file to see the headline numbers
     # -------------------------------------------------------
     print("\n--- SUMMARY ---")
-    print(f"{'Run':<50} {'Latency':>8} {'Exact':>8} {'Semantic':>10} {'Missing':>9} {'Mismatch':>10}")
+    print(f"{'Run':<50} {'Latency':>8} {'Exact':>8} {'LLM':>8} {'Missing':>9} {'Halluc':>8} {'Gaps':>6}")
     print("-" * 100)
     for r in results:
         cmp = r.get("comparison", {})
         if cmp:
             exact    = f"{cmp['exact_score']:.1%}"
-            semantic = f"{cmp['semantic_score']:.1%}"
+            llm      = f"{cmp['llm_score']:.1%}"
             missing  = str(cmp["missing_in_run"])
-            mismatch = str(cmp["mismatches"])
+            halluc   = str(cmp["hallucinations"])
+            gaps     = str(cmp["retrieval_gaps"])
         else:
             exact = "—"
-            semantic = "(baseline)"
+            llm = "(baseline)"
             missing = "—"
-            mismatch = "—"
-        print(f"{r['run']:<50} {str(r['latency_seconds']) + 's':>8} {exact:>8} {semantic:>10} {missing:>9} {mismatch:>10}")
+            halluc = "—"
+            gaps = "—"
+        print(f"{r['run']:<50} {str(r['latency_seconds']) + 's':>8} {exact:>8} {llm:>8} {missing:>9} {halluc:>8} {gaps:>6}")
