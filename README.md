@@ -4,7 +4,7 @@
 [![Run](https://img.shields.io/badge/run-python%20run.py-success)](#quick-start)
 [![HPC](https://img.shields.io/badge/cluster-Longleaf%20l40--gpu-6f42c1)](#option-b-longleaf-gpu-workflow-for-full-hichunk-stack)
 
-`vv` is a reproducible benchmark that compares retrieval strategies for LLM analysis of legal text.
+Reproducible benchmark that compares retrieval strategies for LLM analysis of legal text.
 
 It runs the same model prompt against multiple context-construction methods and measures:
 
