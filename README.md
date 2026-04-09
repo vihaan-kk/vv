@@ -1,4 +1,4 @@
-# vv: AI Retrieval Benchmark for Document Analysis
+# AI Retrieval Benchmark for Document Analysis
 
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#setup)
 [![Run](https://img.shields.io/badge/run-python%20run.py-success)](#quick-start)
